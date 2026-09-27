@@ -1,0 +1,108 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Niang\Core;
+
+/**
+ * Cookies chiffrés (Crypt, AES-256-GCM) : le navigateur ne peut ni lire ni modifier la valeur. Le
+ * chiffré est lié au nom du cookie (une valeur valide pour « panier » est refusée sous
+ * « remember ») et porte sa propre date d'expiration, vérifiée côté serveur — un cookie recopié
+ * après son expiration est refusé même si le navigateur l'a gardé.
+ *
+ * Les cookies signés par une version précédente du framework (HMAC, en clair) ne sont plus
+ * acceptés : Cookie::get() retourne la valeur par défaut, comme pour un cookie absent.
+ */
+class Cookie
+{
+    /** @var array<string, array{value: string|null, minutes: int}> rattachés à la réponse par Application::handle() */
+    private static array $queued = [];
+
+    /**
+     * Pour du code qui n'a pas la réponse sous la main (ex. Auth::login()) : le cookie part avec
+     * la réponse de la requête en cours, via Response::cookie() — donc visible dans les tests.
+     */
+    public static function queue(string $name, string $value, int $minutes = 60): void
+    {
+        self::$queued[$name] = ['value' => $value, 'minutes' => $minutes];
+    }
+
+    public static function queueForget(string $name): void
+    {
+        self::$queued[$name] = ['value' => null, 'minutes' => 0];
+    }
+
+    /**
+     * @internal Application::handle()
+     *
+     * @return array<string, array{value: string|null, minutes: int}>
+     */
+    public static function pullQueued(): array
+    {
+        $queued = self::$queued;
+        self::$queued = [];
+
+        return $queued;
+    }
+    public static function set(string $name, string $value, int $minutes = 60): void
+    {
+        setcookie($name, self::encode($name, $value, $minutes), [
+            'expires' => time() + $minutes * 60,
+            'path' => '/',
+            'httponly' => true,
+            'secure' => self::resolveSecureFlag(),
+            'samesite' => Config::get('session.same_site', 'Lax'),
+        ]);
+    }
+
+    public static function get(string $name, mixed $default = null): mixed
+    {
+        if (!isset($_COOKIE[$name]) || !is_string($_COOKIE[$name])) {
+            return $default;
+        }
+
+        return self::decode($name, $_COOKIE[$name]) ?? $default;
+    }
+
+    public static function forget(string $name): void
+    {
+        setcookie($name, '', [
+            'expires' => time() - 3600,
+            'path' => '/',
+            'httponly' => true,
+            'secure' => self::resolveSecureFlag(),
+            'samesite' => Config::get('session.same_site', 'Lax'),
+        ]);
+    }
+
+    private static function encode(string $name, string $value, int $minutes): string
+    {
+        $payload = json_encode(['v' => $value, 'e' => time() + $minutes * 60], JSON_THROW_ON_ERROR);
+
+        return Crypt::encrypt($payload, "cookie:$name");
+    }
+
+    private static function decode(string $name, string $encrypted): ?string
+    {
+        $payload = Crypt::decrypt($encrypted, "cookie:$name");
+        $data = $payload !== null ? json_decode($payload, true) : null;
+
+        if (!is_array($data) || !is_string($data['v'] ?? null) || !is_int($data['e'] ?? null) || $data['e'] < time()) {
+            return null;
+        }
+
+        return $data['v'];
+    }
+
+    /** Devine si la requête courante est en HTTPS, sauf si config/session.php force explicitement une valeur. */
+    private static function resolveSecureFlag(): bool
+    {
+        $configured = Config::get('session.secure');
+
+        if ($configured !== null) {
+            return (bool) $configured;
+        }
+
+        return !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off';
+    }
+}
